@@ -70,6 +70,10 @@ __all__ = [
     "cuda_memory_snapshot",
     "format_profile_report",
     "print_profile_report",
+    "preflight_check",
+    "summarize_model_placement",
+    "summarize_model_dtypes",
+    "summarize_inputs"
 ]
 
 
@@ -516,6 +520,12 @@ def measure_inference_time(
     percentile: int = 95,
     device: Optional[Union[str, torch.device]] = None,
     use_amp_fp16: bool = False,
+    *,
+    move_model: bool = False,
+    move_inputs: bool = True,
+    sync_cuda: bool = True,
+    reset_cuda_peak: bool = True,
+    empty_cuda_cache: bool = False,
 ) -> Dict[str, float]:
     """Measure forward-pass inference latency (ms).
 
@@ -550,8 +560,23 @@ def measure_inference_time(
 
     dev = torch.device(device) if device is not None else _infer_device(model, None)
 
-    model = model.to(dev)
-    inputs = _move_inputs_to_device(inputs, dev)
+    if reset_cuda_peak and dev.type == "cuda":
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+    if empty_cuda_cache and dev.type == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    if move_model:
+        model = model.to(dev)
+
+    if move_inputs:
+        inputs = _move_inputs_to_device(inputs, dev)
 
     with torch.no_grad():
         for _ in range(max(0, warmup_runs)):
@@ -561,7 +586,7 @@ def measure_inference_time(
             else:
                 _ = _call_model_forward(model, inputs)
 
-            if dev.type == "cuda":
+            if sync_cuda and dev.type == "cuda":
                 torch.cuda.synchronize()
 
     latencies_ms: List[float] = []
@@ -575,7 +600,7 @@ def measure_inference_time(
             else:
                 _ = _call_model_forward(model, inputs)
 
-            if dev.type == "cuda":
+            if sync_cuda and dev.type == "cuda":
                 torch.cuda.synchronize()
 
             end = time.perf_counter()
@@ -603,6 +628,12 @@ def measure_generation_time(
     percentile: int = 95,
     device: Optional[Union[str, torch.device]] = None,
     use_amp_fp16: bool = False,
+    generate_kwargs: Optional[Dict[str, Any]] = None,
+    move_model: bool = False,
+    move_inputs: bool = True,
+    sync_cuda: bool = True,
+    reset_cuda_peak: bool = True,
+    empty_cuda_cache: bool = False,
 ) -> Dict[str, float]:
     """Measure generation latency (ms) via `model.generate()` (if available).
 
@@ -637,15 +668,31 @@ def measure_generation_time(
     model.eval()
     dev = torch.device(device) if device is not None else _infer_device(model, None)
 
-    model = model.to(dev)
-    inputs = _move_inputs_to_device(inputs, dev)
+    if reset_cuda_peak and dev.type == "cuda":
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+    if empty_cuda_cache and dev.type == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    if move_model:
+        model = model.to(dev)
+
+    if move_inputs:
+        inputs = _move_inputs_to_device(inputs, dev)
 
     def _call_generate() -> Any:
+        gk = generate_kwargs or {}
         if isinstance(inputs, (list, tuple)):
-            return model.generate(*inputs, max_new_tokens=max_new_tokens)
+            return model.generate(*inputs, max_new_tokens=max_new_tokens, **gk)
         if isinstance(inputs, Mapping):
-            return model.generate(**inputs, max_new_tokens=max_new_tokens)
-        return model.generate(inputs, max_new_tokens=max_new_tokens)
+            return model.generate(**inputs, max_new_tokens=max_new_tokens, **gk)
+        return model.generate(inputs, max_new_tokens=max_new_tokens, **gk)
 
     with torch.no_grad():
         for _ in range(max(0, warmup_runs)):
@@ -655,7 +702,7 @@ def measure_generation_time(
             else:
                 _ = _call_generate()
 
-            if dev.type == "cuda":
+            if sync_cuda and dev.type == "cuda":
                 torch.cuda.synchronize()
 
     latencies_ms: List[float] = []
@@ -669,7 +716,7 @@ def measure_generation_time(
             else:
                 _ = _call_generate()
 
-            if dev.type == "cuda":
+            if sync_cuda and dev.type == "cuda":
                 torch.cuda.synchronize()
 
             end = time.perf_counter()
@@ -706,6 +753,13 @@ def profile_model(
     near_zero_threshold: float = 1e-6,
     measure_generate: bool = False,
     max_new_tokens: int = 50,
+    generate_kwargs: Optional[Dict[str, Any]] = None,
+    enforce_greedy_generate: bool = True,
+    move_model: bool = False,
+    move_inputs: bool = True,
+    preflight: bool = True,
+    expected_device: Optional[Union[str, torch.device]] = None,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run a practical profiling suite in a single call.
 
@@ -741,6 +795,19 @@ def profile_model(
     Dict[str, Any]
         Profiling report.
     """
+    meta: Optional[Dict[str, Any]] = None
+    if preflight:
+        try:
+            meta = preflight_check(
+                model,
+                sample_inputs,
+                expected_device=expected_device,
+                seed=seed,
+                require_eval_mode=True,
+            )
+        except Exception as exc:
+            meta = {"error": str(exc)}
+
     param_summary = count_parameters(model)
     model_size_mb = estimate_model_size_mb(model, include_buffers=True)
     state_dict_size_mb = estimate_state_dict_size_mb(model)
@@ -762,6 +829,11 @@ def profile_model(
         warmup_runs=warmup_runs,
         percentile=percentile,
         use_amp_fp16=False,
+        move_model=move_model,
+        move_inputs=move_inputs,
+        sync_cuda=True,
+        reset_cuda_peak=True,
+        empty_cuda_cache=False,
     )
 
     out: Dict[str, Any] = {
@@ -770,10 +842,18 @@ def profile_model(
         "state_dict_size_mb": state_dict_size_mb,
         "layer_stats": layer_stats,
         "latency_ms": latency_ms,
+        "meta": meta,
     }
 
     if measure_generate:
         try:
+            gk = dict(generate_kwargs or {})
+            if enforce_greedy_generate:
+                # Make generation comparable across runs
+                gk.setdefault("do_sample", False)
+                gk.setdefault("num_beams", 1)
+                gk.setdefault("use_cache", True)
+
             out["generation_latency_ms"] = measure_generation_time(
                 model,
                 inputs=sample_inputs,
@@ -783,6 +863,12 @@ def profile_model(
                 percentile=percentile,
                 max_new_tokens=max_new_tokens,
                 use_amp_fp16=False,
+                generate_kwargs=gk,
+                move_model=move_model,
+                move_inputs=move_inputs,
+                sync_cuda=True,
+                reset_cuda_peak=True,
+                empty_cuda_cache=False,
             )
         except Exception as exc:
             out["generation_latency_ms"] = {"error": str(exc)}
@@ -856,6 +942,226 @@ def cuda_memory_snapshot() -> Dict[str, float]:
     }
 
 
+
+
+# ---------------------------------------------------------------------
+# Fairness / preflight helpers (optional)
+# ---------------------------------------------------------------------
+
+
+def summarize_model_placement(
+    model: nn.Module,
+    *,
+    max_tensors: int = 200,
+    include_buffers: bool = True,
+) -> Dict[str, Any]:
+    """Summarize where model tensors live (device placement).
+
+    This is useful for ensuring "apples-to-apples" comparisons between runs.
+
+    Parameters
+    ----------
+    model:
+        A PyTorch module.
+    max_tensors:
+        Maximum number of parameters/buffers to scan (for speed).
+    include_buffers:
+        Whether to include buffers in the summary.
+
+    Returns
+    -------
+    Dict[str, Any]
+        counts_by_device, example_tensors, all_on_single_device (bool), single_device (or None)
+    """
+    counts: Dict[str, int] = {}
+    examples: List[Dict[str, str]] = []
+
+    def _add(dev: torch.device, name: str, kind: str) -> None:
+        key = str(dev)
+        counts[key] = counts.get(key, 0) + 1
+        if len(examples) < 12:
+            examples.append({"name": name, "kind": kind, "device": key})
+
+    n = 0
+    for name, p in model.named_parameters(recurse=True):
+        _add(p.device, name, "param")
+        n += 1
+        if n >= max_tensors:
+            break
+
+    if include_buffers:
+        n_b = 0
+        for name, b in model.named_buffers(recurse=True):
+            _add(b.device, name, "buffer")
+            n_b += 1
+            if n + n_b >= max_tensors:
+                break
+
+    devices = list(counts.keys())
+    single_device = devices[0] if len(devices) == 1 else None
+    return {
+        "counts_by_device": counts,
+        "example_tensors": examples,
+        "all_on_single_device": len(devices) == 1,
+        "single_device": single_device,
+    }
+
+
+def summarize_model_dtypes(
+    model: nn.Module,
+    *,
+    max_tensors: int = 200,
+    include_buffers: bool = True,
+) -> Dict[str, Any]:
+    """Summarize dtype usage across model parameters/buffers."""
+    counts: Dict[str, int] = {}
+    examples: List[Dict[str, str]] = []
+
+    def _add(dtype: torch.dtype, name: str, kind: str) -> None:
+        key = str(dtype).replace("torch.", "")
+        counts[key] = counts.get(key, 0) + 1
+        if len(examples) < 12:
+            examples.append({"name": name, "kind": kind, "dtype": key})
+
+    n = 0
+    for name, p in model.named_parameters(recurse=True):
+        _add(p.dtype, name, "param")
+        n += 1
+        if n >= max_tensors:
+            break
+
+    if include_buffers:
+        n_b = 0
+        for name, b in model.named_buffers(recurse=True):
+            _add(b.dtype, name, "buffer")
+            n_b += 1
+            if n + n_b >= max_tensors:
+                break
+
+    return {"counts_by_dtype": counts, "example_tensors": examples}
+
+
+def summarize_inputs(inputs: TensorLikeInputs) -> Dict[str, Any]:
+    """Summarize sample input shapes/dtypes/devices for reproducible profiling."""
+    def _t_summary(t: torch.Tensor) -> Dict[str, Any]:
+        return {
+            "shape": list(t.shape),
+            "dtype": str(t.dtype).replace("torch.", ""),
+            "device": str(t.device),
+        }
+
+    if isinstance(inputs, torch.Tensor):
+        return {"kind": "tensor", "tensor": _t_summary(inputs)}
+
+    if isinstance(inputs, (list, tuple)):
+        return {
+            "kind": "sequence",
+            "tensors": [_t_summary(t) for t in inputs],
+        }
+
+    if isinstance(inputs, Mapping):
+        out: Dict[str, Any] = {"kind": "mapping", "tensors": {}}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                out["tensors"][str(k)] = _t_summary(v)
+            else:
+                out["tensors"][str(k)] = {"type": str(type(v))}
+        return out
+
+    return {"kind": "unknown", "type": str(type(inputs))}
+
+
+def preflight_check(
+    model: nn.Module,
+    sample_inputs: TensorLikeInputs,
+    *,
+    expected_device: Optional[Union[str, torch.device]] = None,
+    require_all_on_expected_device: bool = False,
+    expected_first_param_dtype: Optional[torch.dtype] = None,
+    require_eval_mode: bool = True,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run lightweight checks to maximize fairness across profiling runs.
+
+    This function can be called before profiling "BASE vs LORA" to ensure:
+    - same device placement (no CPU/offload surprises)
+    - same evaluation mode (model.eval())
+    - same input shapes and devices
+    - optional seeds for reproducibility
+
+    Returns a metadata dict you can store alongside profiling results.
+    """
+    if require_eval_mode and model.training:
+        model.eval()
+
+    if seed is not None:
+        try:
+            import random
+
+            random.seed(seed)
+        except Exception:
+            pass
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    placement = summarize_model_placement(model, include_buffers=True)
+    dtypes = summarize_model_dtypes(model, include_buffers=True)
+    inputs_info = summarize_inputs(sample_inputs)
+
+    exp_dev = torch.device(expected_device) if expected_device is not None else None
+    if exp_dev is not None:
+        # We rely on a *sample* of tensors for speed; for strict checks set max_tensors high.
+        # Here we check the first parameter (most reliable quick signal).
+        try:
+            first_param = next(model.parameters())
+            first_dev = first_param.device
+            if require_all_on_expected_device and str(first_dev) != str(exp_dev):
+                raise AssertionError(
+                    f"Expected model on {exp_dev} but first parameter is on {first_dev}."
+                )
+        except StopIteration:
+            pass
+
+    if expected_first_param_dtype is not None:
+        try:
+            first_param = next(model.parameters())
+            if first_param.dtype != expected_first_param_dtype:
+                raise AssertionError(
+                    f"Expected first param dtype {expected_first_param_dtype} "
+                    f"but got {first_param.dtype}."
+                )
+        except StopIteration:
+            pass
+
+    meta: Dict[str, Any] = {
+        "model_training": bool(model.training),
+        "device_map": getattr(model, "hf_device_map", None),
+        "placement": placement,
+        "dtypes": dtypes,
+        "inputs": inputs_info,
+        "torch": {
+            "version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": torch.version.cuda if hasattr(torch.version, "cuda") else None,
+        },
+    }
+
+    if torch.cuda.is_available():
+        try:
+            idx = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(idx)
+            meta["cuda_device"] = {
+                "index": int(idx),
+                "name": props.name,
+                "total_memory_mb": float(props.total_memory / (1024**2)),
+            }
+        except Exception:
+            pass
+
+    return meta
+
 # ---------------------------------------------------------------------
 # Pretty reporting (optional Rich)
 # ---------------------------------------------------------------------
@@ -924,6 +1230,26 @@ def format_profile_report(
 
     if state_size_mb is not None:
         lines.append(f">> Size (state_dict):     {float(state_size_mb):.{decimals}f} MB")
+
+
+    meta = report.get("meta") or {}
+    if isinstance(meta, dict) and meta:
+        # Keep this section compact for logs
+        device_map = meta.get("device_map")
+        placement = (meta.get("placement") or {}).get("counts_by_device")
+        dtypes = (meta.get("dtypes") or {}).get("counts_by_dtype")
+        inputs_info = meta.get("inputs")
+
+        if device_map is not None:
+            lines.append("")
+            lines.append(f">> HF device_map: {device_map}")
+        if placement:
+            lines.append(f">> Tensor devices: {placement}")
+        if dtypes:
+            lines.append(f">> Tensor dtypes:  {dtypes}")
+        if inputs_info:
+            lines.append(f">> Inputs:        {inputs_info}")
+
 
     if latency:
         lines.append("")
@@ -1002,6 +1328,25 @@ def print_profile_report(
         summary_lines.append(
             f"[bold]State_dict size:[/bold] {float(state_size_mb):.{decimals}f} MB"
         )
+
+
+    meta = report.get("meta") or {}
+    if isinstance(meta, dict) and meta:
+        try:
+            placement = (meta.get("placement") or {}).get("counts_by_device")
+            dtypes = (meta.get("dtypes") or {}).get("counts_by_dtype")
+            inputs_info = meta.get("inputs")
+            device_map = meta.get("device_map")
+            if device_map is not None:
+                summary_lines.append(f"[bold]HF device_map:[/bold] {device_map}")
+            if placement:
+                summary_lines.append(f"[bold]Tensor devices:[/bold] {placement}")
+            if dtypes:
+                summary_lines.append(f"[bold]Dtypes:[/bold] {dtypes}")
+            if inputs_info:
+                summary_lines.append(f"[bold]Inputs:[/bold] {inputs_info}")
+        except Exception:
+            pass
 
     console.print(Panel("\n".join(summary_lines), title="Model Summary", expand=False))
 

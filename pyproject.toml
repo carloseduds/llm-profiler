@@ -1,0 +1,16 @@
+[project]
+name = "llm-profiler"
+version = "0.1.0"
+description = "Practical profiling utilities for PyTorch models and LLMs."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "torch"]
+
+[project.optional-dependencies]
+pretty = ["rich"]
+data = ["pandas"]
+plot = ["matplotlib"]
+hf = ["transformers"]
+
+[tool.setuptools]
+py-modules = ["llm_profiler"]
